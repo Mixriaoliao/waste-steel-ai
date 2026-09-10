@@ -1,12 +1,19 @@
-# --- 强制中文字体挂载逻辑 (防止乱码) ---
-import matplotlib.font_manager as fm
 import os
-import urllib.request
+
+import matplotlib.font_manager as fm
+import matplotlib.image as mpimg
+import matplotlib.pyplot as plt
+import streamlit as st
+from PIL import Image
+
+from src.classifier import WasteSteelClassifier
+from src.features import extract_heuristic_features
+from src.visualization import map_pc_to_pixel
+
 
 def load_demo_font():
-    # 强制指定字体保存路径，使用绝对路径确保云端部署时也能正确找到
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    font_path = os.path.join(base_dir, "fonts", "SourceHanSansSC-Regular.otf")
+    font_path = os.path.join(base_dir, "fonts", "SourceHanSansSC-Regular.otf.ttf")
     if os.path.exists(font_path):
         fm.fontManager.addfont(font_path)
         plt.rcParams['font.family'] = fm.FontProperties(fname=font_path).get_name()
@@ -15,170 +22,13 @@ def load_demo_font():
     return None
 
 my_font = load_demo_font()
-# ------------------------------------
-import streamlit as st
-import numpy as np
-from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-from sklearn.decomposition import PCA
 
-# 核心逻辑：改进的 K-means++ 和加权马氏距离
-class WasteSteelClassifier:
-    def __init__(self):
-        # 聚类中心（基于研究报告）
-        self.cluster_centers = {
-            'I': np.array([8.3, 5.1, 0.92]),  # 厚度(mm), 锈蚀(%), 纯度
-            'II': np.array([4.2, 27.7, 0.74]),
-            'III': np.array([2.2, 51.0, 0.48])
-        }
-        # 权重设置
-        self.weights = np.array([0.42, 0.35, 0.23])  # 厚度, 锈蚀, 纯度
-        # 类别名称映射
-        self.class_names = {
-            'I': 'I类（优质）',
-            'II': 'II类（标准）',
-            'III': 'III类（劣质）'
-        }
-        # 初始化 PCA 模型并拟合
-        self.pca = self._initialize_pca()
-        # 计算 loadings
-        self.loadings = self.pca.components_
-        # 特征名称
-        self.feature_names = ['厚度', '锈蚀', '纯度']
-
-    def _initialize_pca(self):
-        """初始化 PCA 模型，确保与可视化脚本的数据逻辑完全对齐"""
-        # 1. 强制设定固定随机种子，保证每次运行生成的投影矩阵完全相同
-        np.random.seed(42)
-
-        # 2. 模拟生成与底图一致的训练数据集分布
-        n_samples_per_class = 400
-
-        # I类数据分布：厚度高、锈蚀低、纯度高
-        class1 = np.random.multivariate_normal([8.5, 10.0, 0.92],
-                                               [[1.5, -0.5, 0.01], [-0.5, 5.0, -0.01], [0.01, -0.01, 0.001]],
-                                               n_samples_per_class)
-        # II类数据分布：中等特征
-        class2 = np.random.multivariate_normal([4.5, 30.0, 0.75],
-                                               [[1.0, -0.2, 0.01], [-0.2, 10.0, -0.02], [0.01, -0.02, 0.005]],
-                                               n_samples_per_class)
-        # III类数据分布：厚度低、锈蚀高、纯度低
-        class3 = np.random.multivariate_normal([2.5, 55.0, 0.45],
-                                               [[0.5, -0.1, 0.01], [-0.1, 15.0, -0.05], [0.01, -0.05, 0.01]],
-                                               n_samples_per_class)
-
-        X_train = np.vstack([class1, class2, class3])
-
-        # 3. 拟合 PCA 模型，确定 PC1 和 PC2 的坐标轴方向
-        pca = PCA(n_components=2)
-        pca.fit(X_train)
-        return pca
-    
-    def transform_to_pc(self, feature_vector):
-        """将特征向量转换为主成分空间"""
-        # 确保输入是二维数组
-        if len(feature_vector.shape) == 1:
-            feature_vector = feature_vector.reshape(1, -1)
-        # 转换到主成分空间
-        pc_coords = self.pca.transform(feature_vector)
-        return pc_coords[0]  # 返回一维数组
-
-    def map_pc_to_pixel(self, pc_coords, img_width, img_height):
-        """
-        精准像素对齐：针对底图布局进行非对称补偿
-        解决标题、轴标签导致的十字架偏位问题
-        """
-        # --- 步骤 1：严格对齐坐标轴刻度 ---
-        # 观察底图：横轴 PC1 为 -30 到 50，纵轴 PC2 为 -4 到 4
-        pc1_min, pc1_max = -30, 50
-        pc2_min, pc2_max = -4, 4
-
-        # 坐标归一化处理 (0-1)
-        pc1_norm = (pc_coords[0] - pc1_min) / (pc1_max - pc1_min)
-        pc2_norm = (pc_coords[1] - pc2_min) / (pc2_max - pc2_min)
-
-        # --- 步骤 2：针对图片布局进行“像素级”边距补偿 ---
-        # 根据影簇矩界底图的视觉分布，设置四个方向的留白比例
-        margin_left = 0.12  # 左侧留给纵轴数值
-        margin_right = 0.08  # 右侧留白较少
-        margin_top = 0.16  # 上方留给大标题和子标题
-        margin_bottom = 0.12  # 下方留给横轴标签
-
-        # --- 步骤 3：计算最终映射像素 ---
-        # 计算 X 坐标：起始点 + 比例 * 可用宽度
-        x = int((margin_left + pc1_norm * (1 - margin_left - margin_right)) * img_width)
-
-        # 计算 Y 坐标：因为像素 0 在顶部，所以 Y 轴需要反向映射
-        # 逻辑：1.0 - pc2_norm 代表数学上的高位对应像素上的低位
-        y = int((margin_top + (1.0 - pc2_norm) * (1 - margin_top - margin_bottom)) * img_height)
-
-        return x, y
-    
-    def calculate_weighted_mahalanobis(self, feature_vector):
-        """计算加权马氏距离"""
-        distances = {}
-        for cls, center in self.cluster_centers.items():
-            # 计算加权欧氏距离（简化版加权马氏距离）
-            weighted_diff = (feature_vector - center) * np.sqrt(self.weights)
-            distance = np.sqrt(np.sum(weighted_diff ** 2))
-            distances[cls] = distance
-        return distances
-    
-    def classify(self, feature_vector):
-        """分类并计算置信度"""
-        distances = self.calculate_weighted_mahalanobis(feature_vector)
-        # 找到最近的聚类中心
-        predicted_class = min(distances, key=distances.get)
-        # 计算置信度（距离越近，置信度越高）
-        max_distance = max(distances.values())
-        min_distance = distances[predicted_class]
-        confidence = 1.0 - (min_distance / max_distance) if max_distance > 0 else 1.0
-        confidence = round(confidence * 100, 2)
-        # 计算主成分坐标
-        pc_coords = self.transform_to_pc(feature_vector)
-        return predicted_class, confidence, pc_coords
-
-    def extract_features(self, image):
-        """
-        优化后的半实装逻辑：基于图像像素特征模拟物理参数
-        1. 亮度(Brightness) -> 映射为纯度和锈蚀
-        2. 边缘密度/标准差(Std) -> 映射为厚度
-        """
-        # --- 步骤 1：基础图像处理 ---
-        # 转换为灰度图，方便进行数学计算
-        img_gray = image.convert('L')
-        img_array = np.array(img_gray)
-
-        # --- 步骤 2：提取像素统计特征 ---
-        # 计算平均亮度 (0为全黑，1为全白)
-        brightness = img_array.mean() / 255.0
-        # 计算标准差 (反映纹理复杂程度，通常废钢越厚、堆积越乱，标准差越大)
-        pixel_std = img_array.std() / 255.0
-
-        # --- 步骤 3：建立像素与物理特征的逻辑关联 ---
-        # 为了保证演示时“同一张图结果固定”，设置基于图片内容的随机种子
-        np.random.seed(hash(image.tobytes()) % 4294967296)
-
-        # 1. 厚度模拟：纹理越复杂(std高)，通常意味着废钢形状越大、厚度越高
-        # 基础厚度 3mm，根据 std 波动 2-8mm
-        thickness = np.clip(3.0 + (pixel_std * 15.0), 1.0, 15.0)
-
-        # 2. 锈蚀模拟：亮度越低，通常意味着表面氧化严重或光泽度差
-        # 逻辑：亮度 0.8 以上基本无锈(5%)，亮度 0.2 以下重锈(70%)
-        corrosion = np.clip((1.0 - brightness) * 80.0 + np.random.uniform(-5, 5), 5.0, 85.0)
-
-        # 3. 纯度模拟：亮度高通常意味着金属质感好
-        # 逻辑：亮度直接决定纯度基准，波动范围在 0.4-0.98 之间
-        purity = np.clip(brightness * 1.1 - 0.05, 0.4, 0.98)
-
-        return np.array([thickness, corrosion, purity])
 # 初始化分类器
 classifier = WasteSteelClassifier()
 
 # 设置页面配置
 st.set_page_config(
-    page_title="影簇智检 - 数字化判级终端",
+    page_title="影簇智检 - 启发式演示终端",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"  # 默认折叠侧边栏，适合移动设备
@@ -187,9 +37,9 @@ st.set_page_config(
 with st.sidebar:
     st.header("⚙️ 终端控制台")
     # 专家模式开关完全中文化
-    expert_mode = st.toggle("开启专家模式", value=False, help="开启后展示底层物理特征与空间投影坐标")
+    expert_mode = st.toggle("开启专家模式", value=False, help="开启后展示启发式代理值与合成 PCA 投影坐标")
     st.divider()
-    st.info("💡 提示：本终端已连接智能判定引擎，支持实时工业级废钢分类。")
+    st.info("💡 当前为启发式可视化原型，不是经过工业数据验证的自动判级系统。")
 # 顶部大标题
 st.markdown("""
     <style>
@@ -315,59 +165,55 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # 中间文件上传区域
-st.markdown("<h3 style='text-align: center; margin-bottom: 20px;'>上传废钢照片进行智能判级</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='text-align: center; margin-bottom: 20px;'>上传图片体验启发式匹配</h3>", unsafe_allow_html=True)
 
 col1, col2, col3 = st.columns([1, 2, 1])
 with col2:
     # --- 替换 2：上传器中文显示 ---
     uploaded_file = st.file_uploader("请上传或拖拽废钢现场照片", type=["jpg", "jpeg", "png"])
     
-    # 增加实时判级模拟按钮
-    st.button("📸 开启实时判级", key="realtime_btn", help="模拟实时相机判级功能")
-    
     if uploaded_file is not None:
         # 显示上传的图片
         image = Image.open(uploaded_file)
         st.image(image, caption="上传的废钢照片", use_container_width=True)
         
-        # 智能定界按钮
-        if st.button("智能定界", key="classify_btn", help="点击进行智能判级"):
+        if st.button("运行演示匹配", key="classify_btn", help="计算启发式代理特征并匹配固定演示中心"):
             # 提取特征向量
-            feature_vector = classifier.extract_features(image)
+            feature_vector = extract_heuristic_features(image)
             
             # 分类
-            predicted_class, confidence, pc_coords = classifier.classify(feature_vector)
+            predicted_class, matching_score, pc_coords = classifier.classify(feature_vector)
             
             # 保存当前特征向量和主成分坐标用于后续显示
             st.session_state['current_features'] = feature_vector
             st.session_state['predicted_class'] = predicted_class
             st.session_state['pc_coords'] = pc_coords
-            st.session_state['confidence'] = confidence
+            st.session_state['matching_score'] = matching_score
             st.session_state['class_name'] = classifier.class_names[predicted_class]
 
             # --- 优化后的结果展示区 ---
             st.markdown("---")
-            st.subheader("🤖 智能判定结论")
+            st.subheader("🧭 演示匹配结果")
 
             # 改用HTML+CSS卡片布局展示结果
-            if confidence > 75:
+            if matching_score > 75:
                 # 绿色通过面板
                 st.markdown(f"""
                     <div class="result-card pass">
-                        <h3>✅ 自动判定通过</h3>
+                        <h3>最近中心匹配结果</h3>
                         <div class="result-value">{classifier.class_names[predicted_class]}</div>
-                        <div>算法置信度：{confidence}%</div>
-                        <p style="color: green; margin-top: 10px;">当前样本符合工业标准，判定通过。</p>
+                        <div>启发式相对匹配分数：{matching_score}%</div>
+                        <p style="color: green; margin-top: 10px;">该分数不是校准概率，也不代表样本符合工业质量标准。</p>
                     </div>
                 """, unsafe_allow_html=True)
-            elif confidence > 65:
+            elif matching_score > 65:
                 # 黄色警告面板
                 st.markdown(f"""
                     <div class="result-card review">
-                        <h3>⚠️ 判定建议</h3>
+                        <h3>⚠️ 边界匹配结果</h3>
                         <div class="result-value">{classifier.class_names[predicted_class]}</div>
-                        <div>算法置信度：{confidence}%</div>
-                        <p style="color: orange; margin-top: 10px;">样本位于边界区域，建议开启人工复核。</p>
+                        <div>启发式相对匹配分数：{matching_score}%</div>
+                        <p style="color: orange; margin-top: 10px;">该演示结果只适合流程展示，不可代替人工检验。</p>
                     </div>
                 """, unsafe_allow_html=True)
                 
@@ -380,7 +226,7 @@ with col2:
                 
                 final_level = st.radio(
                     "人工复核最终等级为何？",
-                    options=["I类（优质）", "II类（标准）", "III类（劣质）"],
+                    options=["I类（演示中心）", "II类（演示中心）", "III类（演示中心）"],
                     key="final_level"
                 )
                 
@@ -393,10 +239,10 @@ with col2:
                         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "original_class": classifier.class_names[predicted_class],
                         "corrected_class": final_level,
-                        "confidence": confidence,
-                        "thickness": feature_vector[0],
-                        "corrosion": feature_vector[1],
-                        "purity": feature_vector[2]
+                        "matching_score": matching_score,
+                        "thickness_proxy": feature_vector[0],
+                        "corrosion_proxy": feature_vector[1],
+                        "purity_proxy": feature_vector[2]
                     }
                     
                     # 写入CSV文件
@@ -407,23 +253,23 @@ with col2:
                             writer.writeheader()
                         writer.writerow(feedback_data)
                     
-                    st.success("✅ 复核结果已提交，感谢您的反馈！这些数据将用于模型自我迭代。")
+                    st.success("✅ 复核结果已保存到本地 feedback.csv；当前原型不会自动训练或更新模型。")
             else:
                 # 红色错误面板
                 st.markdown(f"""
                     <div class="result-card error">
-                        <h3>🚨 预警</h3>
+                        <h3>低匹配度</h3>
                         <div class="result-value">{classifier.class_names[predicted_class]}</div>
-                        <div>算法置信度：{confidence}%</div>
-                        <p style="color: red; margin-top: 10px;">特征严重偏移！置信度极低，请进行专家仲裁。</p>
+                        <div>启发式相对匹配分数：{matching_score}%</div>
+                        <p style="color: red; margin-top: 10px;">样本与固定演示中心的距离较远；不能据此作质量判断。</p>
                     </div>
                 """, unsafe_allow_html=True)
 
             # 保留详细数据，放在折叠栏里，显得专业又不乱
-            with st.expander("🔍 专家视图：查看底层物理特征向量", expanded=expert_mode):
+            with st.expander("🔍 专家视图：查看启发式代理特征向量", expanded=expert_mode):
                 st.write(
-                    f"厚度: {feature_vector[0]:.2f}mm | 锈蚀: {feature_vector[1]:.2f}% | 纯度: {feature_vector[2]:.2f}")
-                st.write(f"PCA投影坐标: PC1={pc_coords[0]:.2f}, PC2={pc_coords[1]:.2f}")
+                    f"厚度代理值: {feature_vector[0]:.2f} | 锈蚀代理值: {feature_vector[1]:.2f} | 纯度代理值: {feature_vector[2]:.2f}")
+                st.write(f"合成 PCA 投影坐标: PC1={pc_coords[0]:.2f}, PC2={pc_coords[1]:.2f}")
                 
                 # 增加判定过程的时间线展示
                 st.markdown("""
@@ -437,14 +283,14 @@ with col2:
                         </div>
                         <div class="timeline-item right">
                             <div class="timeline-content">
-                                <h5>物理特征提取中</h5>
-                                <p>分析厚度、锈蚀、纯度等关键指标</p>
+                                <h5>代理特征计算</h5>
+                                <p>将亮度和像素标准差映射为演示值</p>
                             </div>
                         </div>
                         <div class="timeline-item left">
                             <div class="timeline-content">
-                                <h5>马氏距离核算</h5>
-                                <p>计算样本与各类别中心的加权距离</p>
+                                <h5>加权欧氏距离核算</h5>
+                                <p>计算代理向量与各固定演示中心的距离</p>
                             </div>
                         </div>
                         <div class="timeline-item right">
@@ -475,7 +321,7 @@ with col2:
             img_height, img_width, _ = img.shape
             
             # 使用 classifier 的方法将主成分坐标映射到像素位置
-            x, y = classifier.map_pc_to_pixel(pc_coords, img_width, img_height)
+            x, y = map_pc_to_pixel(pc_coords, img_width, img_height)
             
             # 添加红色十字光标
             cross_size = 20
@@ -537,7 +383,7 @@ st.markdown("""
 # 底部信息
 st.markdown("""
     <div style='text-align: center; margin-top: 40px; color: #666; font-size: 0.9rem;'>
-        <p>影簇智检 - 废钢智能判级系统 v1.0</p>
-        <p>基于改进的 K-means++ 和加权马氏距离算法</p>
+        <p>影簇智检 - 废钢图像启发式演示原型</p>
+        <p>基于固定演示中心、加权欧氏距离与合成 PCA 投影</p>
     </div>
 """, unsafe_allow_html=True)
